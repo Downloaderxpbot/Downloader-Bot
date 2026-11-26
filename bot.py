@@ -1182,9 +1182,8 @@ def _base_ydl_opts(
         },
         "continuedl": True,
         "restrictfilenames": True,
-        "socket_timeout": 30,
-        "concurrent_fragment_downloads": min(MAX_DL_THREADS, 8),
-        "http_chunk_size": 10 * 1024 * 1024,
+        "socket_timeout": 15,
+        "concurrent_fragment_downloads": min(MAX_DL_THREADS, 12 if is_youtube else 8),
         "buffersize": 512 * 1024,
         "geo_bypass": True,
         "postprocessor_args": {"default": ["-loglevel", "error", "-nostats", "-threads", "2"]},
@@ -1193,6 +1192,8 @@ def _base_ydl_opts(
     }
 
     if is_youtube:
+        # YouTube এর থ্রটলিং এড়াতে 10MB চাঙ্ক-রেঞ্জ কেবল YouTube-এই ব্যবহার করা হয় (অন্য সাইটে একটানা স্ট্রিম চলে)
+        opts["http_chunk_size"] = 10 * 1024 * 1024
         # YouTube এর জন্য yt-dlp কে তার নিজস্ব per-client User-Agent (tv, visionos, android, ios, mweb)
         # ব্যবহার করতে দেওয়া হয় — কাস্টম ডেস্কটপ http_headers দিলে ক্লায়েন্ট মিসম্যাচে 429/403 হয়।
         if player_clients:
@@ -2734,7 +2735,7 @@ def _try_turbo_http_download(
                 try:
                     assert shared_sess is not None
                     r_h = {**hdrs, "Range": f"bytes={s_byte}-{e_byte}"}
-                    with shared_sess.get(final_url, headers=r_h, stream=True, timeout=25) as resp:
+                    with shared_sess.get(final_url, headers=r_h, stream=True, timeout=(8, 12)) as resp:
                         if resp.status_code != 206:
                             raise RuntimeError(f"HTTP {resp.status_code}")
                         ce = (resp.headers.get("Content-Encoding") or "").strip().lower()
@@ -3030,7 +3031,7 @@ def _try_turbo_hls_download(
     has_discontinuity = "#EXT-X-DISCONTINUITY" in m_text
     can_live_pipe_mux = (not is_audio_only) and (not has_discontinuity) and (total_segs >= 4)
     is_strict_cdn = "project1content.com" in base_m_url.lower()
-    max_hls_workers = 12 if is_strict_cdn else 28
+    max_hls_workers = 10 if is_strict_cdn else 28
     workers_n = max(4, min(MAX_DL_THREADS, max_hls_workers, total_segs))
     prog_lock = threading.Lock()
     rate_lock = threading.Lock()
@@ -3043,7 +3044,9 @@ def _try_turbo_hls_download(
     tight_disk = _free_disk_mb() < 4096
     cooldown_until = 0.0
     next_req_ts = 0.0
-    pace_interval = 0.0
+    # Strict CDN-এ ~৯০০ req/min স্লাইডিং উইন্ডো থাকে; ছোট ভিডিওতে দ্রুত বার্স্ট এবং বড় ভিডিওতে স্মুথ গ্লাইড পেসিং (জিরো ২৫s ফ্রিজ!)
+    pace_floor = (0.015 if total_segs <= 650 else 0.020) if is_strict_cdn else 0.0
+    pace_interval = pace_floor
     done_segs = 0
     downloaded_bytes = 0
     last_hook_ts = 0.0
@@ -3061,6 +3064,7 @@ def _try_turbo_hls_download(
         """ডাউনলোড চলাকালীনই ক্রমানুসারে s_00000..s_{N-1}.ts সরাসরি ffmpeg pipe:0-এ ফিড করে যাতে শেষ সেগমেন্টেই MP4 প্রস্তুত হয়ে যায়!"""
         nonlocal pipe_mux_ok, live_mux_proc
         err_log_f = None
+        err_log_path = seg_dir / "live_mux_err.log"
         proc: Optional[subprocess.Popen] = None
         try:
             for m_idx in range(total_segs):
@@ -3077,15 +3081,17 @@ def _try_turbo_hls_download(
                         hdr_b = pf.read(192)
                     if not hdr_b or hdr_b[0] != 0x47 or (len(hdr_b) >= 189 and hdr_b[188] != 0x47):
                         return
-                    err_log_f = open(seg_dir / "live_mux_err.log", "wb")
+                    err_log_f = open(err_log_path, "wb")
                     ff_cmd = [
                         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y",
-                        "-threads", "2", "-f", "mpegts", "-i", "pipe:0",
+                        "-threads", "2",
+                        "-fflags", "+genpts+igndts+discardcorrupt",
+                        "-f", "mpegts", "-i", "pipe:0",
                     ]
                     if is_novoice:
-                        ff_cmd += ["-c:v", "copy", "-an", str(out_live_mp4)]
+                        ff_cmd += ["-c:v", "copy", "-an", "-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", str(out_live_mp4)]
                     else:
-                        ff_cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc", str(out_live_mp4)]
+                        ff_cmd += ["-c", "copy", "-bsf:a", "aac_adtstoasc", "-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "4096", str(out_live_mp4)]
                     proc = subprocess.Popen(
                         ff_cmd,
                         stdin=subprocess.PIPE,
@@ -3114,6 +3120,13 @@ def _try_turbo_hls_download(
                 proc.wait(timeout=180)
                 if not abort_flag.is_set() and proc.returncode == 0 and out_live_mp4.exists() and out_live_mp4.stat().st_size > 0:
                     pipe_mux_ok = True
+                elif not abort_flag.is_set():
+                    err_tail = ""
+                    with contextlib.suppress(Exception):
+                        if err_log_f is not None:
+                            err_log_f.flush()
+                        err_tail = err_log_path.read_text(encoding="utf-8", errors="ignore")[-220:]
+                    logger.warning("Live HLS pipe mux rc=%s (%s) — concat ফলব্যাকে যাচ্ছে", proc.returncode, err_tail.strip())
         except Exception as lm_err:
             logger.debug("Live HLS pipe mux skipped (%s) — concat fallback ready.", lm_err)
         finally:
@@ -3137,41 +3150,60 @@ def _try_turbo_hls_download(
         while time.monotonic() < end_m:
             if abort_flag.is_set():
                 return False
-            time.sleep(min(0.25, max(0.01, end_m - time.monotonic())))
+            time.sleep(min(0.20, max(0.01, end_m - time.monotonic())))
         return not abort_flag.is_set()
 
-    def _await_rate_gate() -> bool:
-        nonlocal next_req_ts
+    def _await_rate_gate(seg_num: int) -> bool:
+        nonlocal next_req_ts, pace_interval, pace_floor
+        # দীর্ঘ ভিডিওতে (>৬৫০ সেগমেন্ট) প্রথম ৪৫০ সেগমেন্ট ঝড়ের গতিতে নামার পর স্লাইডিং উইন্ডো সীমার নিচে স্মুথ পেসিং বজায় রাখা
+        if is_strict_cdn and total_segs > 650 and seg_num >= 450 and pace_floor < 0.068:
+            with rate_lock:
+                if pace_floor < 0.068:
+                    pace_floor = 0.068
+                    pace_interval = max(pace_interval, pace_floor)
+        slot_wait = 0.0
         while not abort_flag.is_set():
             with rate_lock:
                 now_m = time.monotonic()
-                cd_wait = cooldown_until - now_m
-                if cd_wait <= 0:
-                    slot_wait = max(0.0, next_req_ts - now_m)
-                    if pace_interval > 0.0:
-                        next_req_ts = max(now_m, next_req_ts) + pace_interval
-                    break
-            if not _sleep_cancelable(cd_wait + random.uniform(0.05, 0.35)):
+                if now_m < cooldown_until:
+                    sleep_cd = (cooldown_until - now_m) + random.uniform(0.02, 0.12)
+                else:
+                    eff_pace = max(pace_interval, pace_floor)
+                    slot_ts = max(now_m, next_req_ts)
+                    slot_wait = slot_ts - now_m
+                    if slot_wait <= 8.0:
+                        if eff_pace > 0.0:
+                            next_req_ts = slot_ts + eff_pace
+                        break
+                    sleep_cd = 0.5
+            if not _sleep_cancelable(sleep_cd):
                 return False
         else:
             return False
         if slot_wait > 0.002:
-            return _sleep_cancelable(min(slot_wait, 10.0))
+            return _sleep_cancelable(slot_wait)
         return not abort_flag.is_set()
 
-    def _note_cdn_rate_limit(rl_try: int, retry_after_hdr: Optional[str] = None) -> None:
-        nonlocal cooldown_until, pace_interval, next_req_ts
+    def _note_cdn_rate_limit(retry_after_hdr: Optional[str] = None) -> None:
+        nonlocal cooldown_until, pace_interval, pace_floor, next_req_ts
         ra_sec = 0.0
         if retry_after_hdr and retry_after_hdr.strip().isdigit():
             ra_sec = float(retry_after_hdr.strip())
-        wait_s = max(ra_sec, min(25.0, 2.5 * (1.55 ** rl_try))) + random.uniform(0.15, 0.65)
+        # কখনোই ২৫ সেকেন্ডের ফ্রিজ নয় — সর্বোচ্চ ১.৮-২.৩ সেকেন্ডের সংক্ষিপ্ত ইপক বিরতি ও স্মুথ AIMD পেসিং!
+        wait_s = (min(6.0, max(1.0, ra_sec)) if ra_sec > 0 else 1.8) + random.uniform(0.10, 0.35)
         with rate_lock:
             now_m = time.monotonic()
-            if now_m >= cooldown_until:
-                logger.info("⏳ CDN HTTP 429 রেট-লিমিট শনাক্ত — সব থ্রেড %.1fs কুলডাউন নিয়ে স্বয়ংক্রিয়ভাবে রিজিউম করবে...", wait_s)
-            cooldown_until = max(cooldown_until, now_m + wait_s)
-            pace_interval = min(0.16, max(0.045, pace_interval * 1.45 if pace_interval > 0 else 0.045))
-            next_req_ts = max(next_req_ts, cooldown_until)
+            if now_m < cooldown_until:
+                # একই বার্স্টের বাকি ইন-ফ্লাইট থ্রেডগুলোর জন্য ডুপ্লিকেট কুলডাউন/মাল্টিপ্লাই স্কিপ করা!
+                return
+            pace_interval = min(0.24, max(0.082, (pace_interval * 1.25) if pace_interval > 0 else 0.082))
+            pace_floor = min(0.18, max(pace_floor, pace_interval * 0.88))
+            cooldown_until = now_m + wait_s
+            next_req_ts = max(next_req_ts, cooldown_until + pace_interval)
+            logger.info(
+                "⏳ CDN 429 স্মুথ পেসিং অ্যাডজাস্ট (pause=%.1fs, rate=%.1f seg/s) — কোনো ফ্রিজ ছাড়াই ডাউনলোড চলমান...",
+                wait_s, 1.0 / max(0.01, pace_interval),
+            )
 
     try:
         # ১টি শেয়ার্ড SSLContext/PoolManager + 1MB SO_RCVBUF সকেট টিউনিং (প্রায় ১৬০ MB OpenSSL C-heap সাশ্রয়!)
@@ -3208,20 +3240,20 @@ def _try_turbo_hls_download(
             rl_tries = 0
             err_tries = 0
             while not abort_flag.is_set():
-                if not _await_rate_gate():
+                if not _await_rate_gate(s_idx):
                     return
                 seg_fd: Optional[int] = None
                 n_b = 0
                 try:
                     assert shared_sess is not None
-                    with shared_sess.get(s_url, headers=hdrs, stream=True, timeout=22) as resp:
+                    with shared_sess.get(s_url, headers=hdrs, stream=True, timeout=(6, 12)) as resp:
                         if resp.status_code in (429, 500, 502, 503, 504):
                             if resp.status_code == 429:
-                                _note_cdn_rate_limit(rl_tries, resp.headers.get("Retry-After"))
+                                _note_cdn_rate_limit(resp.headers.get("Retry-After"))
                             else:
-                                _sleep_cancelable(min(12.0, 1.5 * (rl_tries + 1)))
+                                _sleep_cancelable(min(6.0, 1.0 * (rl_tries + 1)))
                             rl_tries += 1
-                            if rl_tries > 14:
+                            if rl_tries > 40:
                                 _mark_abort()
                                 raise RuntimeError(f"HTTP {resp.status_code} (after {rl_tries} retries)")
                             continue
@@ -3263,9 +3295,9 @@ def _try_turbo_hls_download(
                             ready_segs.add(s_idx)
                             mux_cond.notify_all()
 
-                    if pace_interval > 0.0:
+                    if pace_interval > pace_floor:
                         with rate_lock:
-                            pace_interval = pace_interval * 0.985 if pace_interval > 0.008 else 0.0
+                            pace_interval = max(pace_floor, pace_interval * 0.992)
 
                     should_emit = False
                     now_t = time.time()
