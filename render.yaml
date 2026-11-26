@@ -1,0 +1,33 @@
+# ==============================================================================
+# Render.com Pro Plan Docker Deployment Specification (Singapore Region)
+# ==============================================================================
+services:
+  - type: web
+    name: tg-all-in-one-downloader
+    runtime: docker
+    plan: pro
+    region: singapore
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: MAX_QUEUE_SLOTS
+        value: "5"
+      - key: MAX_DL_THREADS
+        value: "28"
+      - key: MAX_HTTP_RANGE_THREADS
+        value: "24"
+      - key: MTPROTO_POOL_SIZE
+        value: "32"
+      - key: SLOTS_PER_AUTH_KEY
+        value: "5"
+      - key: UPLOAD_PIPELINE_DEPTH
+        value: "5"

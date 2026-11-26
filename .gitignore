@@ -1,0 +1,33 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Runtime sessions, cookies & caches (synced via cloud env vars, never committed)
+.env
+cookies.txt
+cookies_runtime.txt
+telethon_session.txt
+telethon_pool_keys.json
+download_history.json
+*.session
+*.session-journal
+*.zip
+
+# Media & temp files
+downloads/
+tdlib-data/
+temp/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

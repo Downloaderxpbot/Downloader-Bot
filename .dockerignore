@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.git
+.gitignore
+.env
+downloads/
+tdlib-data/
+bot/
+*.zip
+cookies.txt
+cookies_runtime.txt
+telethon_session.txt
+README.md
+render.yaml

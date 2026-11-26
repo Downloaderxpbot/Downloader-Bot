@@ -1,0 +1,8 @@
+python-telegram-bot[job-queue]==21.6
+yt-dlp>=2024.10.7
+Flask==3.0.3
+requests==2.32.3
+Telethon>=1.36.0
+cryptg>=0.4.0
+pycryptodomex>=3.20.0
+uvloop>=0.21.0; sys_platform != 'win32'
